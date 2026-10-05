@@ -542,4 +542,97 @@ button.danger {
   gap: 24px;
 }
 
+/* ----------------------------------------------------- cue correction */
+
+.pause-hint {
+  margin: 0 0 12px;
+  color: #e0b46a;
+  font-size: 0.85rem;
+}
+
+.correction-form {
+  border: 1px solid #a07a3c;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 0 0 14px;
+  background: #211c13;
+}
+
+.correction-form code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.cue-list li.correcting {
+  border-color: #a07a3c;
+}
+
+button.cue-correct {
+  margin-left: auto;
+  padding: 3px 12px;
+  font-size: 0.78rem;
+  border-radius: 6px;
+}
+
+.corrections-log {
+  margin-top: 18px;
+  border-top: 1px solid #2c3040;
+  padding-top: 14px;
+}
+
+.corrections-log h3 {
+  margin: 0 0 10px;
+  font-size: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.correction-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.correction-list li {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  background: #0d0f14;
+  border: 1px solid #232733;
+  border-radius: 8px;
+  padding: 7px 12px;
+}
+
+.correction-values {
+  font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.correction-old {
+  color: #e08a8a;
+  text-decoration: line-through;
+}
+
+.correction-arrow {
+  color: #6f7688;
+}
+
+.correction-new {
+  color: #5fd38d;
+}
+
+.correction-version {
+  margin-left: auto;
+  color: #9aa0b0;
+  font-size: 0.78rem;
+}
 

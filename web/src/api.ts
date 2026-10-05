@@ -49,6 +49,21 @@ export interface DeviationState {
   final: DeviationFinal | null;
 }
 
+/**
+ * One committed cue correction, kept for audit. The timeline (`cues`) only
+ * shows the effective value; the superseded value lives exclusively here.
+ */
+export interface CueCorrection {
+  /** 0-based index into the live timeline. */
+  position: number;
+  oldValue: number;
+  newValue: number;
+  /** Session version at which the correction committed. */
+  version: number;
+  /** Global request id of the correction command. */
+  requestId: string;
+}
+
 export interface Performance {
   id: string;
   name: string;
@@ -58,6 +73,7 @@ export interface Performance {
   cues: number[];
   plan: PlannedCueSequence | null;
   deviation: DeviationState | null;
+  corrections: CueCorrection[];
 }
 
 export type PerformanceCommand =
@@ -78,6 +94,18 @@ export type PerformanceCommand =
   | {
       command: 'registerCue';
       performanceId: string;
+      cue: number;
+      expectedVersion: number;
+      requestId: string;
+    }
+  | {
+      command: 'correctCue';
+      performanceId: string;
+      /** 0-based index of the registered cue to replace. */
+      position: number;
+      /** Optimistic check: the value currently effective at `position`. */
+      expectedOldValue: number;
+      /** Replacement value. */
       cue: number;
       expectedVersion: number;
       requestId: string;

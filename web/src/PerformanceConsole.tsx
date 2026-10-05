@@ -185,21 +185,59 @@ export default function PerformanceConsole({ store }: { store: ConsoleStore }) {
           )}
 
           {session.status === 'paused' && (
-            <div className="actions">
-              <button onClick={() => store.transition('running')} disabled={s.commandBusy}>
-                继续（→ 运行）
-              </button>
-              <button
-                className="danger"
-                onClick={() => store.transition('ended')}
-                disabled={s.commandBusy}
-              >
-                结束
-              </button>
-            </div>
+            <>
+              <div className="actions">
+                <button onClick={() => store.transition('running')} disabled={s.commandBusy}>
+                  继续（→ 运行）
+                </button>
+                <button
+                  className="danger"
+                  onClick={() => store.transition('ended')}
+                  disabled={s.commandBusy}
+                >
+                  结束
+                </button>
+              </div>
+              <p className="pause-hint">
+                暂停核查中：可点击下方时间线某条的「更正」修改录错的 cue，提交后按更正后序列重新判定偏差。
+              </p>
+              {s.correctingPosition !== null &&
+                s.correctingPosition < session.cues.length && (
+                  <div className="correction-form">
+                    <label className="field">
+                      <span>
+                        更正第 {s.correctingPosition + 1} 条（当前生效值{' '}
+                        <code>{session.cues[s.correctingPosition]}</code>
+                        ；提交时以此值为预期旧值）
+                      </span>
+                      <span className="field-row">
+                        <input
+                          type="number"
+                          step={1}
+                          value={s.correctionDraft}
+                          onChange={(e) => store.setCorrectionDraft(e.target.value)}
+                          placeholder="替换值（整数 cue）"
+                          disabled={s.commandBusy}
+                        />
+                        <button onClick={() => store.submitCorrection()} disabled={s.commandBusy}>
+                          {s.commandBusy ? '提交中…' : '提交更正'}
+                        </button>
+                        <button
+                          className="secondary"
+                          onClick={() => store.cancelCorrection()}
+                          disabled={s.commandBusy}
+                        >
+                          取消
+                        </button>
+                      </span>
+                    </label>
+                  </div>
+                )}
+            </>
           )}
 
-          <Timeline session={session} />
+          <Timeline session={session} state={s} store={store} />
+          <CorrectionsLog session={session} />
         </article>
       )}
     </section>
@@ -310,8 +348,19 @@ function DeviationPanel({ session }: { session: Performance }) {
   );
 }
 
-function Timeline({ session }: { session: Performance }) {
+function Timeline({
+  session,
+  state,
+  store,
+}: {
+  session: Performance;
+  state: { commandBusy: boolean; correctingPosition: number | null };
+  store: ConsoleStore;
+}) {
   const sealed = session.status === 'ended';
+  // Corrections are a paused-state review tool; running and sealed
+  // timelines never offer them.
+  const canCorrect = session.status === 'paused';
   return (
     <div className={`timeline${sealed ? ' sealed' : ''}`}>
       <h3>
@@ -323,14 +372,53 @@ function Timeline({ session }: { session: Performance }) {
       ) : (
         <ol className="cue-list">
           {session.cues.map((cue, i) => (
-            <li key={i}>
+            <li key={i} className={state.correctingPosition === i ? 'correcting' : undefined}>
               <span className="cue-index">#{i + 1}</span>
               <span className="cue-value">{cue}</span>
+              {canCorrect && (
+                <button
+                  className="secondary cue-correct"
+                  onClick={() => store.beginCorrection(i)}
+                  disabled={state.commandBusy}
+                >
+                  更正
+                </button>
+              )}
             </li>
           ))}
         </ol>
       )}
       {sealed && <p className="sealed-note">场次已结束，时间线封存，不再接受写入。</p>}
+    </div>
+  );
+}
+
+/**
+ * Audit trail of committed corrections. The timeline above shows only the
+ * effective values; the superseded value of each correction is viewable
+ * here together with the version it committed as.
+ */
+function CorrectionsLog({ session }: { session: Performance }) {
+  if (session.corrections.length === 0) return null;
+  return (
+    <div className="corrections-log">
+      <h3>
+        更正记录
+        <span className="timeline-count">{session.corrections.length} 条</span>
+      </h3>
+      <ol className="correction-list">
+        {session.corrections.map((c, i) => (
+          <li key={i}>
+            <span className="cue-index">#{c.position + 1}</span>
+            <span className="correction-values">
+              <span className="correction-old">{c.oldValue}</span>
+              <span className="correction-arrow">→</span>
+              <span className="correction-new">{c.newValue}</span>
+            </span>
+            <span className="correction-version">提交于版本 #{c.version}</span>
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }

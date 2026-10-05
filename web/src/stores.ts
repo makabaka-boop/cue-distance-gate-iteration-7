@@ -164,6 +164,13 @@ export interface ConsoleState {
   planEnabledDraft: boolean;
   planCuesDraft: string;
   planKDraft: string;
+  /**
+   * 0-based timeline position currently open for correction (null = the
+   * form is closed). Only meaningful while the shown session is paused.
+   */
+  correctingPosition: number | null;
+  /** Replacement value text; consumed only by a committed correction. */
+  correctionDraft: string;
 }
 
 export interface ConsoleDeps {
@@ -217,6 +224,8 @@ export class ConsoleStore extends Store<ConsoleState> {
       planEnabledDraft: false,
       planCuesDraft: '',
       planKDraft: '',
+      correctingPosition: null,
+      correctionDraft: '',
     });
     this.deps = deps;
   }
@@ -246,6 +255,25 @@ export class ConsoleStore extends Store<ConsoleState> {
   }
 
   /**
+   * Open the correction form for one timeline row. Only a paused session
+   * with a cue at that position can be corrected; anything else is a no-op.
+   */
+  beginCorrection(position: number): void {
+    const session = this.state.session;
+    if (!session || session.status !== 'paused') return;
+    if (!Number.isInteger(position) || position < 0 || position >= session.cues.length) return;
+    this.patch({ correctingPosition: position, correctionDraft: '', error: null });
+  }
+
+  cancelCorrection(): void {
+    this.patch({ correctingPosition: null, correctionDraft: '' });
+  }
+
+  setCorrectionDraft(correctionDraft: string): void {
+    this.patch({ correctionDraft });
+  }
+
+  /**
    * Merge an arriving snapshot with the one on screen. Loads and commands may
    * be in flight simultaneously and settle in any order. A response belonging
    * to the latest user action may switch the displayed session, but a GET must
@@ -263,24 +291,32 @@ export class ConsoleStore extends Store<ConsoleState> {
       return;
     }
     this.sessionRef = next;
-    this.patch({ session: next });
+    if ((current && current.id !== next.id) || next.status !== 'paused') {
+      // A different session is now on screen, or the session left the
+      // paused review state: an open correction form no longer refers to a
+      // correctable row of the displayed timeline — close it.
+      this.patch({ session: next, correctingPosition: null, correctionDraft: '' });
+    } else {
+      this.patch({ session: next });
+    }
   }
 
   private runCommand(
     action: () => Promise<Performance>,
     targetSessionId: string | null,
-    cueSessionId?: string,
+    effects: { cueSessionId?: string; correctionSessionId?: string } = {},
   ): void {
     const cmdGen = ++this.commandGeneration;
     const viewGen = ++this.viewGeneration;
     this.commandInFlight += 1;
     this.patch({ commandBusy: true, error: null });
-    if (cueSessionId) this.pendingCueSessions.add(cueSessionId);
+    if (effects.cueSessionId) this.pendingCueSessions.add(effects.cueSessionId);
     void action().then(
       (snapshot) => {
         const stale = this.viewGeneration !== viewGen;
         this.adoptSnapshot(snapshot, stale);
-        if (cueSessionId) {
+        if (effects.cueSessionId) {
+          const cueSessionId = effects.cueSessionId;
           this.pendingCueSessions.delete(cueSessionId);
           // A committed cue consumes its draft only when the box is still
           // showing the session it belonged to. After a session switch the
@@ -290,9 +326,18 @@ export class ConsoleStore extends Store<ConsoleState> {
             this.patch({ cueDraft: '' });
           }
         }
+        if (effects.correctionSessionId) {
+          // A committed correction closes its form only when the screen
+          // still shows the session it belonged to; after a session switch
+          // the form was already closed by adoptSnapshot.
+          const currentId = this.sessionRef?.id ?? null;
+          if (currentId === effects.correctionSessionId) {
+            this.patch({ correctingPosition: null, correctionDraft: '' });
+          }
+        }
       },
       (err) => {
-        if (cueSessionId) this.pendingCueSessions.delete(cueSessionId);
+        if (effects.cueSessionId) this.pendingCueSessions.delete(effects.cueSessionId);
         // A rejected command changes nothing server-side; keep the snapshot
         // AND the cue draft so the stage manager can correct and retry.
         //
@@ -411,7 +456,47 @@ export class ConsoleStore extends Store<ConsoleState> {
           requestId: this.deps.newRequestId(),
         }),
       session.id,
+      { cueSessionId: session.id },
+    );
+  }
+
+  /**
+   * Submit the open correction form. The expected old value and the version
+   * are read from the snapshot at submit time, so the server adjudicates
+   * against exactly what the stage manager saw; a rejection keeps the form,
+   * the draft and the on-screen session untouched for a corrected retry.
+   */
+  submitCorrection(): void {
+    const session = this.state.session;
+    const position = this.state.correctingPosition;
+    if (!session || position === null) return;
+    const expectedOldValue = session.cues[position];
+    if (expectedOldValue === undefined) {
+      // The row vanished from under the form (e.g. a foreign snapshot):
+      // close rather than fire a command that cannot match.
+      this.cancelCorrection();
+      return;
+    }
+    let cue: number;
+    try {
+      cue = parseInt32(this.state.correctionDraft);
+    } catch (err) {
+      this.patch({ error: toConsoleError(err) });
+      return;
+    }
+    this.runCommand(
+      () =>
+        this.deps.submit({
+          command: 'correctCue',
+          performanceId: session.id,
+          position,
+          expectedOldValue,
+          cue,
+          expectedVersion: session.version,
+          requestId: this.deps.newRequestId(),
+        }),
       session.id,
+      { correctionSessionId: session.id },
     );
   }
 }

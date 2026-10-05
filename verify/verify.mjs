@@ -799,12 +799,184 @@ console.log('\n[5b] planned session: per-cue frontier, final verdict and no-adva
     `A=${JSON.stringify(badA.body?.performance?.deviation)} B=${JSON.stringify(goodB.body?.performance?.deviation)}`);
 }
 
+console.log('\n[5c] cue correction: pause-gated rewrite, rebuilt frontier, audit record');
+{
+  // plan [1,2,3,4], k = 1; live 1,2,9,8 crosses the budget at the 4th cue.
+  const create = await sendCommand(WEB_URL, {
+    command: 'create',
+    name: '更正场次',
+    requestId: commandRequestId('corr-create'),
+    planCues: [1, 2, 3, 4],
+    k: 1,
+  });
+  const id = create.body.performance.id;
+  check('correction session created with sealed plan',
+    create.status === 200 && create.body.performance.version === 1, JSON.stringify(create.body));
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('corr-start'),
+  });
+  let v = 2;
+  for (const cue of [1, 2, 9, 8]) {
+    const res = await sendCommand(WEB_URL, {
+      command: 'registerCue', performanceId: id, cue,
+      expectedVersion: v, requestId: commandRequestId(`corr-cue-${v}`),
+    });
+    v += 1;
+    if (cue === 8) {
+      check('stray cues push the frontier beyond budget',
+        res.status === 200 && res.body?.performance?.deviation?.recoverable === false,
+        JSON.stringify(res.body?.performance?.deviation));
+    }
+  }
+
+  // Corrections are a paused-state tool: running rejects with NOT_PAUSED.
+  const whileRunning = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 2, expectedOldValue: 9, cue: 3,
+    expectedVersion: v, requestId: commandRequestId('corr-while-running'),
+  });
+  check('correctCue while running rejected as NOT_PAUSED',
+    whileRunning.status === 409 && whileRunning.body?.error?.reason === 'NOT_PAUSED',
+    `got ${whileRunning.status} ${JSON.stringify(whileRunning.body)}`);
+
+  const pause = await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'paused',
+    expectedVersion: v, requestId: commandRequestId('corr-pause'),
+  });
+  check('paused for review', pause.status === 200, `got ${pause.status}`);
+  v += 1;
+
+  // First correction: 9 -> 3. The rebuilt frontier is recoverable again —
+  // the old sticky "exceeded" conclusion must not be reused.
+  const firstRid = commandRequestId('corr-first');
+  const first = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 2, expectedOldValue: 9, cue: 3,
+    expectedVersion: v, requestId: firstRid,
+  });
+  check(
+    'correction 9->3 commits: recoverable again, timeline shows effective values',
+    first.status === 200 &&
+      first.body?.performance?.version === v + 1 &&
+      JSON.stringify(first.body?.performance?.cues) === '[1,2,3,8]' &&
+      first.body?.performance?.deviation?.recoverable === true &&
+      first.body?.performance?.deviation?.boundary === 1,
+    `got ${first.status} ${JSON.stringify(first.body)}`,
+  );
+  check(
+    'audit record keeps old/new value and the committing version',
+    Array.isArray(first.body?.performance?.corrections) &&
+      first.body.performance.corrections.length === 1 &&
+      first.body.performance.corrections[0]?.position === 2 &&
+      first.body.performance.corrections[0]?.oldValue === 9 &&
+      first.body.performance.corrections[0]?.newValue === 3 &&
+      first.body.performance.corrections[0]?.version === v + 1 &&
+      first.body.performance.corrections[0]?.requestId === firstRid,
+    JSON.stringify(first.body?.performance?.corrections),
+  );
+  v += 1;
+
+  // Replaying the committed id is a duplicate with no side effects.
+  const replay = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 2, expectedOldValue: 9, cue: 3,
+    expectedVersion: v, requestId: firstRid,
+  });
+  check('replayed correction id rejected as DUPLICATE_REQUEST',
+    replay.status === 409 && replay.body?.error?.reason === 'DUPLICATE_REQUEST',
+    `got ${replay.status} ${JSON.stringify(replay.body)}`);
+
+  // Wrong expected old value and bad position are rejected without changes.
+  const wrongOld = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 2, expectedOldValue: 9, cue: 5,
+    expectedVersion: v, requestId: commandRequestId('corr-wrong-old'),
+  });
+  check('stale expected old value rejected as OLD_VALUE_MISMATCH',
+    wrongOld.status === 409 && wrongOld.body?.error?.reason === 'OLD_VALUE_MISMATCH',
+    `got ${wrongOld.status} ${JSON.stringify(wrongOld.body)}`);
+  const badPos = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 4, expectedOldValue: 1, cue: 5,
+    expectedVersion: v, requestId: commandRequestId('corr-bad-pos'),
+  });
+  check('out-of-range position rejected as INVALID_POSITION',
+    badPos.status === 409 && badPos.body?.error?.reason === 'INVALID_POSITION',
+    `got ${badPos.status} ${JSON.stringify(badPos.body)}`);
+
+  // Second correction merges on top: 8 -> 4 restores the exact plan.
+  const second = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 3, expectedOldValue: 8, cue: 4,
+    expectedVersion: v, requestId: commandRequestId('corr-second'),
+  });
+  check('correction 8->4 commits: boundary 0',
+    second.status === 200 &&
+      JSON.stringify(second.body?.performance?.cues) === '[1,2,3,4]' &&
+      second.body?.performance?.deviation?.boundary === 0 &&
+      second.body?.performance?.corrections?.length === 2,
+    `got ${second.status} ${JSON.stringify(second.body)}`);
+  v += 1;
+
+  // Sealing from paused compares the CORRECTED sequence with the whole plan.
+  const end = await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'ended',
+    expectedVersion: v, requestId: commandRequestId('corr-end'),
+  });
+  check('final verdict uses the corrected sequence (exact distance 0)',
+    end.status === 200 &&
+      JSON.stringify(end.body?.performance?.deviation?.final) ===
+        JSON.stringify({ status: 'ok', distance: 0 }),
+    `got ${end.status} ${JSON.stringify(end.body?.performance?.deviation)}`);
+
+  // Corrections stay viewable on the sealed snapshot; ended rejects edits.
+  const sealed = await getPerformance(WEB_URL, id);
+  check('sealed snapshot keeps timeline, corrections and version',
+    sealed.status === 200 &&
+      JSON.stringify(sealed.body?.performance?.cues) === '[1,2,3,4]' &&
+      sealed.body?.performance?.corrections?.length === 2 &&
+      sealed.body?.performance?.version === v + 1,
+    JSON.stringify(sealed.body));
+  const whileEnded = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 0, expectedOldValue: 1, cue: 9,
+    expectedVersion: v + 1, requestId: commandRequestId('corr-while-ended'),
+  });
+  check('correctCue after end rejected as NOT_PAUSED',
+    whileEnded.status === 409 && whileEnded.body?.error?.reason === 'NOT_PAUSED',
+    `got ${whileEnded.status} ${JSON.stringify(whileEnded.body)}`);
+
+  // A legacy session (no plan) corrects too, without inventing deviation data.
+  const legacy = await sendCommand(WEB_URL, {
+    command: 'create', name: '无计划更正', requestId: commandRequestId('corr-legacy-create'),
+  });
+  const lid = legacy.body.performance.id;
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: lid, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('corr-legacy-start'),
+  });
+  await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: lid, cue: 10,
+    expectedVersion: 2, requestId: commandRequestId('corr-legacy-cue'),
+  });
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: lid, status: 'paused',
+    expectedVersion: 3, requestId: commandRequestId('corr-legacy-pause'),
+  });
+  const legacyFix = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: lid, position: 0, expectedOldValue: 10, cue: 11,
+    expectedVersion: 4, requestId: commandRequestId('corr-legacy-fix'),
+  });
+  check('legacy session corrects with null plan/deviation and an audit record',
+    legacyFix.status === 200 &&
+      JSON.stringify(legacyFix.body?.performance?.cues) === '[11]' &&
+      legacyFix.body?.performance?.plan === null &&
+      legacyFix.body?.performance?.deviation === null &&
+      legacyFix.body?.performance?.corrections?.length === 1 &&
+      legacyFix.body?.performance?.corrections[0]?.oldValue === 10 &&
+      legacyFix.body?.performance?.corrections[0]?.newValue === 11,
+    `got ${legacyFix.status} ${JSON.stringify(legacyFix.body)}`);
+}
+
 // Plan envelope validation.
 {
   const half1 = await sendCommand(WEB_URL, {
     command: 'create', name: '半截计划', requestId: commandRequestId('planv-half1'), planCues: [1],
-  });
-  const half2 = await sendCommand(WEB_URL, {
+  });  const half2 = await sendCommand(WEB_URL, {
     command: 'create', name: '半截计划', requestId: commandRequestId('planv-half2'), k: 2,
   });
   const badElem = await sendCommand(WEB_URL, {

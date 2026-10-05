@@ -31,6 +31,7 @@ export function perf(over: Partial<Performance> & { id: string }): Performance {
     cues: over.cues ?? [],
     plan: over.plan ?? null,
     deviation: over.deviation ?? null,
+    corrections: over.corrections ?? [],
     ...over,
   };
 }

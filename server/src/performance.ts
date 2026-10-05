@@ -51,6 +51,22 @@ export interface PlannedCueSequence {
 /** Serializable per-version deviation state (see prefix-distance.ts). */
 export type DeviationState = DeviationSnapshot;
 
+/**
+ * One committed cue correction, kept for audit. The live timeline (`cues`)
+ * only ever shows the *effective* value; the superseded value is preserved
+ * exclusively here, together with the version the correction committed as.
+ */
+export interface CueCorrection {
+  /** 0-based index into the live timeline. */
+  position: number;
+  oldValue: number;
+  newValue: number;
+  /** Session version at which the correction committed. */
+  version: number;
+  /** Global request id of the correction command. */
+  requestId: string;
+}
+
 export interface Performance {
   id: string;
   name: string;
@@ -62,6 +78,8 @@ export interface Performance {
   plan: PlannedCueSequence | null;
   /** Null exactly when plan is null. */
   deviation: DeviationState | null;
+  /** Every committed correction, in commit order (empty when never corrected). */
+  corrections: CueCorrection[];
 }
 
 /** The live aggregate: the mutable frontier tracker never leaves the store. */
@@ -93,14 +111,34 @@ export interface RegisterCueCommand {
   requestId: string;
 }
 
-export type PerformanceCommand = CreateCommand | TransitionCommand | RegisterCueCommand;
+export interface CorrectCueCommand {
+  type: 'correctCue';
+  performanceId: string;
+  /** 0-based index of the registered cue to replace. */
+  position: number;
+  /** Optimistic check: the value currently effective at `position`. */
+  expectedOldValue: number;
+  /** Replacement value. */
+  cue: number;
+  expectedVersion: number;
+  requestId: string;
+}
+
+export type PerformanceCommand =
+  | CreateCommand
+  | TransitionCommand
+  | RegisterCueCommand
+  | CorrectCueCommand;
 
 /** Rejection reasons surfaced alongside code COMMAND_REJECTED. */
 export type RejectReason =
   | 'DUPLICATE_REQUEST'
   | 'VERSION_CONFLICT'
   | 'ILLEGAL_TRANSITION'
-  | 'NOT_RUNNING';
+  | 'NOT_RUNNING'
+  | 'NOT_PAUSED'
+  | 'INVALID_POSITION'
+  | 'OLD_VALUE_MISMATCH';
 
 // Legal status advance table. pending -> running, running <-> paused,
 // running/paused -> ended (no resume required to seal). ended is terminal.
@@ -226,6 +264,7 @@ export class PerformanceStore {
         cues: [],
         plan: command.plan ? { cues: [...command.plan.cues], k: command.plan.k } : null,
         deviation: tracker ? tracker.snapshot() : null,
+        corrections: [],
         tracker,
       };
       this.sessions.set(session.id, session);
@@ -271,7 +310,7 @@ export class PerformanceStore {
       if (command.status === 'ended' && session.tracker) {
         session.tracker.finalize();
       }
-    } else {
+    } else if (command.type === 'registerCue') {
       if (session.status !== 'running') {
         reject(
           'NOT_RUNNING',
@@ -282,6 +321,50 @@ export class PerformanceStore {
       // Exactly one frontier step per accepted cue — rejected commands
       // throw above and never advance the distance state.
       session.tracker?.append(command.cue);
+    } else {
+      // correctCue: replace one already-registered cue. Only the paused
+      // state allows reviewing and correcting the record; ended is sealed.
+      if (session.status !== 'paused') {
+        reject(
+          'NOT_PAUSED',
+          `Cues can only be corrected while paused; session is "${session.status}".`,
+        );
+      }
+      if (command.position >= session.cues.length) {
+        reject(
+          'INVALID_POSITION',
+          `No cue is registered at position ${command.position}; the timeline holds ${session.cues.length} cue(s).`,
+        );
+      }
+      const oldValue = session.cues[command.position];
+      if (oldValue !== command.expectedOldValue) {
+        reject(
+          'OLD_VALUE_MISMATCH',
+          `The cue at position ${command.position} is currently ${oldValue}, not ${command.expectedOldValue}.`,
+        );
+      }
+      // Rebuild the prefix-deviation frontier from the sealed plan against
+      // the *candidate* timeline BEFORE anything is mutated: a correction
+      // can pull an exceeded boundary back within budget, so the sticky
+      // (monotone) frontier of the old timeline must not be reused. Every
+      // rejection above throws before this point, and a rebuild failure
+      // would too — in both cases the session stays exactly as it was.
+      // Sessions without a plan keep deviation null: no data is invented.
+      const candidate = session.cues.slice();
+      candidate[command.position] = command.cue;
+      if (session.plan) {
+        const rebuilt = new PrefixDistanceTracker(session.plan.cues, session.plan.k);
+        for (const cue of candidate) rebuilt.append(cue);
+        session.tracker = rebuilt;
+      }
+      session.cues = candidate;
+      session.corrections.push({
+        position: command.position,
+        oldValue,
+        newValue: command.cue,
+        version: session.version + 1, // the version this correction commits as
+        requestId: command.requestId,
+      });
     }
 
     // Single commit point: version bump and request-id recording happen
@@ -303,6 +386,7 @@ export class PerformanceStore {
       cues: [...session.cues],
       plan: session.plan ? { cues: [...session.plan.cues], k: session.plan.k } : null,
       deviation: session.deviation ? { ...session.deviation, final: session.deviation.final ? { ...session.deviation.final } : null } : null,
+      corrections: session.corrections.map((c) => ({ ...c })),
     };
   }
 }

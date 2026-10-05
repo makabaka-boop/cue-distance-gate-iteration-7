@@ -4,13 +4,16 @@
 
 1. **演出场次控制台**：舞台监督创建场次（`待演`），开演后进入 `运行中`，
    可在运行与暂停间切换，运行时逐条登记整数 cue，结束后查看**封存的只读时间线**。
+   暂停核查时可**更正已登记的 cue**（提交原位置、预期旧值与替换值）；更正记录
+   （旧值 → 新值、提交版本）随快照保留可查看，时间线只呈现生效值。
    创建时**可选**附带一份固定的计划 cue 序列与容许距离 K：此后每提交一条现场
    cue，服务端按插入/删除代价增量维护「现场前缀 ↔ 各计划前缀」的距离边界
    （`min_j D(live[0..i), plan[0..j))`，带状 DP，每 cue O(K)），最小值 ≤ K 即
-   **仍可追回**，> K 即**已超出容许范围**（边界单调、不可回落）；结束场次时再与
-   **完整计划**比较给出最终距离（≤ K 时为精确整数）或 `exceeded`。未附计划的
-   旧场次不返回任何偏差状态，保持原流程。计划仅在创建时封存，此后页面草稿的改动
-   只能影响下一次创建。
+   **仍可追回**，> K 即**已超出容许范围**；结束场次时再与**完整计划**比较给出
+   最终距离（≤ K 时为精确整数）或 `exceeded`。**更正会用候选 cue 序列从封存计划
+   整体重建前缀边界**——因此「已超出」在更正后可能重新变为「仍可追回」，不沿用
+   旧的单调前缀结论；未附计划的旧场次不返回任何偏差状态，可更正但不凭空生成偏差
+   数据。计划仅在创建时封存，此后页面草稿的改动只能影响下一次创建。
    所有变更携带 `expectedVersion`（乐观并发）与 `requestId`（请求去重），
    经单场次串行裁决后一次提交；被拒绝时数据、版本与距离边界均保持不变。
 2. **Cue 序列偏差校验**：在开演间隙核对**计划 cue 序列**与**现场触发序列**
@@ -35,7 +38,7 @@
 | -------- | ---- |
 | `server` | Fastify API（容器内 3000 端口）：距离校验 + 场次命令裁决（内存存储） |
 | `web`    | React 静态页 + nginx `/api` 反向代理，宿主端口由 `WEB_PORT` 覆盖（默认 8080） |
-| `verify` | 一次性验收服务：参考值、5 万项样本、越界结论、场次全生命周期（经 Web 代理）、计划场次的逐条前缀边界（短序列完整 DP 预言机）/终局结论/暂停重试/拒绝与重放不推进/跨场次隔离/旧场次兼容、同步屏障交错的跨场次全局 requestId 去重（两场次 / 创建与修改 / 已提交后换目标）、宿主端口覆盖 |
+| `verify` | 一次性验收服务：参考值、5 万项样本、越界结论、场次全生命周期（经 Web 代理）、计划场次的逐条前缀边界（短序列完整 DP 预言机）/终局结论/暂停重试/拒绝与重放不推进/跨场次隔离/旧场次兼容、暂停态更正（超出→可追回重建、更正记录、重放与旧值/位置/结束态拒绝、无计划场次）、同步屏障交错的跨场次全局 requestId 去重（两场次 / 创建与修改 / 已提交后换目标）、宿主端口覆盖 |
 
 ## 运行（Docker Compose）
 
@@ -49,6 +52,7 @@ docker compose up --build --exit-code-from verify verify
 
 浏览器访问 `http://localhost:${WEB_PORT:-8080}`，默认进入「演出场次控制台」页签：
 填写名称即可创建场次，随后开演 / 暂停 / 继续 / 结束，运行中逐条登记整数 cue，
+暂停时可点击时间线某条的「更正」修改录错的 cue（更正记录随场次保留可查看），
 结束后时间线封存为只读；也可以粘贴场次 ID 重新载入快照（等价于刷新页面）。
 另一页签保留原有的「Cue 序列偏差校验」：两个 JSON 数组编辑区 + 阈值 K，
 点击「比较」后显示精确偏差距离或超限信号。
@@ -93,7 +97,8 @@ docker compose up --build --exit-code-from verify verify
 ## 演出场次 API
 
 会话保存在服务端内存中（单实例）。场次字段：`id`、`name`、`status`、
-`version`、`requestId`（最近一次已提交命令的请求标识）、有序 `cues`。
+`version`、`requestId`（最近一次已提交命令的请求标识）、有序 `cues`
+（仅生效值）、`corrections`（更正记录：位置、旧值、新值、提交版本、请求标识）。
 
 状态机（非法迁移一律拒绝）：
 
@@ -138,6 +143,20 @@ pending ──▶ running ◀──▶ paused
   "expectedVersion": 2, "requestId": "uuid-3" }
 ```
 
+更正已登记 cue（仅 `paused` 可提交；`position` 为 0 基位置，
+`expectedOldValue` 为该位置当前生效值的乐观校验，`cue` 为替换值）：
+
+```json
+{ "command": "correctCue", "performanceId": "<id>", "position": 0,
+  "expectedOldValue": 101, "cue": 105, "expectedVersion": 3, "requestId": "uuid-4" }
+```
+
+更正提交时，服务端先用候选 cue 序列从封存计划**整体重建**前缀偏差状态
+（未附计划的场次保持 `deviation = null`），再一次提交时间线、更正记录、
+版本与新状态；重建前的任何校验失败（状态、位置、旧值、版本）都保持原状。
+快照中 `corrections` 按提交顺序保留每条更正的 `position` / `oldValue` /
+`newValue` / `version` / `requestId`，`cues` 只呈现生效值。
+
 成功响应（200）返回提交后的快照：
 
 ```json
@@ -155,7 +174,8 @@ pending ──▶ running ◀──▶ paused
 - `deviation`：逐条距离状态——
   - `boundary`：`min_j D(现场已听全部前缀, 计划前缀 j)`，代价 > K 时封顶为 `K + 1`；
   - `recoverable`：`boundary ≤ K`，即「仍可追回」；每条**成功提交**的 cue
-    将其推进一格，拒绝、重放、暂停均不推进；
+    将其推进一格，拒绝、重放、暂停均不推进；**更正**则用更正后的候选序列
+    从封存计划整体重建（可能从「已超出」重新回到「仍可追回」）；
   - `final`：运行/暂停时为 `null`；场次结束后为与**完整计划**比较的结论，
     `{ "status": "ok", "distance": d }`（d 为精确整数）或 `{ "status": "exceeded" }`。
 
@@ -165,6 +185,8 @@ pending ──▶ running ◀──▶ paused
 - `expectedVersion` 与当前版本不一致 → `VERSION_CONFLICT`；
 - 状态不在合法迁移表内 → `ILLEGAL_TRANSITION`；
 - 非 `running` 态登记 cue → `NOT_RUNNING`；
+- 非 `paused` 态更正 cue → `NOT_PAUSED`；更正位置越界 → `INVALID_POSITION`；
+  预期旧值与当前生效值不符 → `OLD_VALUE_MISMATCH`；
 - `requestId` **在整个服务生命周期内全局唯一**：同一标识无论打向哪个场次
   （或用于创建），都只对应一次成功提交。已提交标识的任何重放——换另一场次、
   换一个不存在的场次、或改作创建命令——一律返回 `DUPLICATE_REQUEST`，拒绝信息
@@ -188,6 +210,9 @@ React 端唯一的读入口，按 ID 载入快照（刷新页面后据此恢复�
 | 404 | `SESSION_NOT_FOUND` | — | 查询或命令引用了不存在的场次（已提交过的 requestId 除外：其重放优先返回 `DUPLICATE_REQUEST`，即使目标场次不存在） |
 | 409 | `COMMAND_REJECTED` | `ILLEGAL_TRANSITION` | 非法状态迁移 |
 | 409 | `COMMAND_REJECTED` | `NOT_RUNNING` | 非运行态登记 cue |
+| 409 | `COMMAND_REJECTED` | `NOT_PAUSED` | 非暂停态更正 cue（含已结束的封存场次） |
+| 409 | `COMMAND_REJECTED` | `INVALID_POSITION` | 更正位置超出已登记时间线 |
+| 409 | `COMMAND_REJECTED` | `OLD_VALUE_MISMATCH` | 预期旧值与该位置当前生效值不符 |
 | 409 | `COMMAND_REJECTED` | `DUPLICATE_REQUEST` | 请求标识重复 |
 | 409 | `COMMAND_REJECTED` | `VERSION_CONFLICT` | `expectedVersion` 过期 |
 | 400 | `INVALID_BODY` / `INVALID_CUE` / `INVALID_JSON` | — | 命令信封非法 |
@@ -198,7 +223,7 @@ React 端唯一的读入口，按 ID 载入快照（刷新页面后据此恢复�
 
 ```bash
 # 服务端：类型检查 + Vitest（算法边界、随机对拍、5 万项样本、API 校验、
-# 场次状态机、同版本并发仅一条提交与重复请求无副作用）
+# 场次状态机、暂停态更正与偏差重建、同版本并发仅一条提交与重复请求无副作用）
 cd server && npm install && npm test
 
 # 前端（开发服务器代理 /api 到 localhost:3000）
