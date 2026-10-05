@@ -7,7 +7,9 @@
    创建时**可选**附带一份固定的计划 cue 序列与容许距离 K：此后每提交一条现场
    cue，服务端按插入/删除代价增量维护「现场前缀 ↔ 各计划前缀」的距离边界
    （`min_j D(live[0..i), plan[0..j))`，带状 DP，每 cue O(K)），最小值 ≤ K 即
-   **仍可追回**，> K 即**已超出容许范围**（边界单调、不可回落）；结束场次时再与
+   **仍可追回**，> K 即**已超出容许范围**（正常追加时边界单调、不可回落）；暂停核查时可
+   更正录错的 cue，服务端会用更正后的完整候选序列从固定计划**重建**前缀状态，因此更正后
+   可能重新回到「仍可追回」。结束场次时再与
    **完整计划**比较给出最终距离（≤ K 时为精确整数）或 `exceeded`。未附计划的
    旧场次不返回任何偏差状态，保持原流程。计划仅在创建时封存，此后页面草稿的改动
    只能影响下一次创建。
@@ -35,7 +37,7 @@
 | -------- | ---- |
 | `server` | Fastify API（容器内 3000 端口）：距离校验 + 场次命令裁决（内存存储） |
 | `web`    | React 静态页 + nginx `/api` 反向代理，宿主端口由 `WEB_PORT` 覆盖（默认 8080） |
-| `verify` | 一次性验收服务：参考值、5 万项样本、越界结论、场次全生命周期（经 Web 代理）、计划场次的逐条前缀边界（短序列完整 DP 预言机）/终局结论/暂停重试/拒绝与重放不推进/跨场次隔离/旧场次兼容、同步屏障交错的跨场次全局 requestId 去重（两场次 / 创建与修改 / 已提交后换目标）、宿主端口覆盖 |
+| `verify` | 一次性验收服务：参考值、5 万项样本、越界结论、场次全生命周期（经 Web 代理）、计划场次的逐条前缀边界（短序列完整 DP 预言机）/暂停更正重建/终局结论/暂停重试/连续更正、重复请求、拒绝与重放不推进/跨场次隔离/旧场次兼容、同步屏障交错的跨场次全局 requestId 去重（两场次 / 创建与修改 / 已提交后换目标）、宿主端口覆盖 |
 
 ## 运行（Docker Compose）
 
@@ -48,8 +50,9 @@ docker compose up --build --exit-code-from verify verify
 ```
 
 浏览器访问 `http://localhost:${WEB_PORT:-8080}`，默认进入「演出场次控制台」页签：
-填写名称即可创建场次，随后开演 / 暂停 / 继续 / 结束，运行中逐条登记整数 cue，
-结束后时间线封存为只读；也可以粘贴场次 ID 重新载入快照（等价于刷新页面）。
+填写名称即可创建场次，随后开演 / 暂停 / 在暂停核查时更正录错 cue / 继续 / 结束，
+运行中逐条登记整数 cue，结束后时间线封存为只读，但仍可展开查看更正记录；也可以粘贴
+场次 ID 重新载入快照（等价于刷新页面）。
 另一页签保留原有的「Cue 序列偏差校验」：两个 JSON 数组编辑区 + 阈值 K，
 点击「比较」后显示精确偏差距离或超限信号。
 
@@ -93,7 +96,8 @@ docker compose up --build --exit-code-from verify verify
 ## 演出场次 API
 
 会话保存在服务端内存中（单实例）。场次字段：`id`、`name`、`status`、
-`version`、`requestId`（最近一次已提交命令的请求标识）、有序 `cues`。
+`version`、`requestId`（最近一次已提交命令的请求标识）、有序生效 `cues`、
+`corrections`（更正审计记录）。
 
 状态机（非法迁移一律拒绝）：
 
@@ -138,24 +142,43 @@ pending ──▶ running ◀──▶ paused
   "expectedVersion": 2, "requestId": "uuid-3" }
 ```
 
+更正已登记 cue（仅 `paused` 可提交；`position` 从 1 开始）：
+
+```json
+{ "command": "correctCue", "performanceId": "<id>",
+  "position": 2, "oldCue": 205, "newCue": 102,
+  "expectedVersion": 4, "requestId": "uuid-4" }
+```
+
+更正会替换当前时间线该位置的生效值并使版本 +1；`oldCue` 必须与提交时该位置的生效值
+一致。旧值、新值和提交后的版本保存在快照的 `corrections` 审计数组中，`cues` 仍只按顺序
+呈现当前生效值。带计划的场次先用完整候选 cue 序列从空前缀重建整段带状 DP，再在同一次
+裁决中提交时间线、`corrections`、版本与新偏差状态；重建前的任何校验失败、旧值不符或
+版本冲突都不会留下部分修改。未附计划的旧场次也能更正，但 `plan` / `deviation` 仍为
+`null`，不会生成偏差数据。
+
 成功响应（200）返回提交后的快照：
 
 ```json
 { "status": "ok",
   "performance": { "id": "...", "name": "...", "status": "running",
-    "version": 3, "requestId": "uuid-3", "cues": [101],
+    "version": 3, "requestId": "uuid-3",
+    "cues": [101], "corrections": [],
     "plan": { "cues": [101, 102, 103], "k": 3 },
     "deviation": { "k": 3, "plannedLength": 3, "liveLength": 1,
       "boundary": 0, "recoverable": true, "final": null } } }
 ```
 
-快照新增两个字段（旧场次恒为 `null`）：
+快照新增字段：
 
+- `corrections`：已提交更正的审计记录，元素为
+  `{ position, oldCue, newCue, version }`；连续更正会逐条保留。当前 `cues` 只显示每条
+  位置的最新生效值，旧值只在这里查看；
 - `plan`：创建时封存的 `{ cues, k }`，场次存活期间永不改变；
 - `deviation`：逐条距离状态——
   - `boundary`：`min_j D(现场已听全部前缀, 计划前缀 j)`，代价 > K 时封顶为 `K + 1`；
-  - `recoverable`：`boundary ≤ K`，即「仍可追回」；每条**成功提交**的 cue
-    将其推进一格，拒绝、重放、暂停均不推进；
+  - `recoverable`：`boundary ≤ K`，即「仍可追回」；每条**成功追加**的 cue
+    将其推进一格，拒绝、重放、暂停均不推进；成功更正则从完整候选序列重建，允许回落；
   - `final`：运行/暂停时为 `null`；场次结束后为与**完整计划**比较的结论，
     `{ "status": "ok", "distance": d }`（d 为精确整数）或 `{ "status": "exceeded" }`。
 
@@ -165,6 +188,9 @@ pending ──▶ running ◀──▶ paused
 - `expectedVersion` 与当前版本不一致 → `VERSION_CONFLICT`；
 - 状态不在合法迁移表内 → `ILLEGAL_TRANSITION`；
 - 非 `running` 态登记 cue → `NOT_RUNNING`；
+- 非 `paused` 态更正 cue → `NOT_PAUSED`；
+- `position` 不在当前时间线范围内 → `INVALID_POSITION`；
+- `oldCue` 与该位置当前生效值不符 → `OLD_CUE_MISMATCH`；
 - `requestId` **在整个服务生命周期内全局唯一**：同一标识无论打向哪个场次
   （或用于创建），都只对应一次成功提交。已提交标识的任何重放——换另一场次、
   换一个不存在的场次、或改作创建命令——一律返回 `DUPLICATE_REQUEST`，拒绝信息
@@ -188,6 +214,10 @@ React 端唯一的读入口，按 ID 载入快照（刷新页面后据此恢复�
 | 404 | `SESSION_NOT_FOUND` | — | 查询或命令引用了不存在的场次（已提交过的 requestId 除外：其重放优先返回 `DUPLICATE_REQUEST`，即使目标场次不存在） |
 | 409 | `COMMAND_REJECTED` | `ILLEGAL_TRANSITION` | 非法状态迁移 |
 | 409 | `COMMAND_REJECTED` | `NOT_RUNNING` | 非运行态登记 cue |
+| 409 | `COMMAND_REJECTED` | `NOT_PAUSED` | 非暂停态更正 cue |
+| 409 | `COMMAND_REJECTED` | `INVALID_POSITION` | 更正位置不存在 |
+| 409 | `COMMAND_REJECTED` | `OLD_CUE_MISMATCH` | 更正时预期旧值与生效值不符 |
+| 409 | `COMMAND_REJECTED` | `REBUILD_FAILED` | 从候选时间线重建偏差状态失败 |
 | 409 | `COMMAND_REJECTED` | `DUPLICATE_REQUEST` | 请求标识重复 |
 | 409 | `COMMAND_REJECTED` | `VERSION_CONFLICT` | `expectedVersion` 过期 |
 | 400 | `INVALID_BODY` / `INVALID_CUE` / `INVALID_JSON` | — | 命令信封非法 |

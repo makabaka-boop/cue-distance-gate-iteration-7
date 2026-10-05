@@ -6,8 +6,10 @@
  *   name      - stage-manager supplied label
  *   status    - pending -> running <-> paused -> ended
  *   version   - optimistic-concurrency token, starts at 1, +1 per commit
- *   requestId - id of the last command that was committed to the session
- *   cues      - ordered int32 cues registered while the session is running
+ *   requestId   - id of the last command that was committed to the session
+ *   cues        - ordered, currently-effective int32 cues
+ *   corrections - audit trail of paused cue corrections; `cues` itself only
+ *                 shows the replacement value that is in force
  *
  * Every command passes through two serialisation points:
  *
@@ -58,10 +60,26 @@ export interface Performance {
   version: number;
   requestId: string | null;
   cues: number[];
+  /**
+   * Immutable audit entries for committed corrections. The effective timeline
+   * remains `cues`; this list is the only place old values remain visible.
+   */
+  corrections: CueCorrectionRecord[];
   /** Null for sessions created without a plan — those keep the old flow. */
   plan: PlannedCueSequence | null;
   /** Null exactly when plan is null. */
   deviation: DeviationState | null;
+}
+
+export interface CueCorrectionRecord {
+  /** One-based position in the effective timeline at correction time. */
+  position: number;
+  /** Value the stage manager asserted was previously at that position. */
+  oldCue: number;
+  /** Replacement value now effective at that position. */
+  newCue: number;
+  /** Version produced by the correction commit (old version + 1). */
+  version: number;
 }
 
 /** The live aggregate: the mutable frontier tracker never leaves the store. */
@@ -93,14 +111,32 @@ export interface RegisterCueCommand {
   requestId: string;
 }
 
-export type PerformanceCommand = CreateCommand | TransitionCommand | RegisterCueCommand;
+export interface CorrectCueCommand {
+  type: 'correctCue';
+  performanceId: string;
+  position: number;
+  oldCue: number;
+  newCue: number;
+  expectedVersion: number;
+  requestId: string;
+}
+
+export type PerformanceCommand =
+  | CreateCommand
+  | TransitionCommand
+  | RegisterCueCommand
+  | CorrectCueCommand;
 
 /** Rejection reasons surfaced alongside code COMMAND_REJECTED. */
 export type RejectReason =
   | 'DUPLICATE_REQUEST'
   | 'VERSION_CONFLICT'
   | 'ILLEGAL_TRANSITION'
-  | 'NOT_RUNNING';
+  | 'NOT_RUNNING'
+  | 'NOT_PAUSED'
+  | 'INVALID_POSITION'
+  | 'OLD_CUE_MISMATCH'
+  | 'REBUILD_FAILED';
 
 // Legal status advance table. pending -> running, running <-> paused,
 // running/paused -> ended (no resume required to seal). ended is terminal.
@@ -224,6 +260,7 @@ export class PerformanceStore {
         version: 1,
         requestId: command.requestId,
         cues: [],
+        corrections: [],
         plan: command.plan ? { cues: [...command.plan.cues], k: command.plan.k } : null,
         deviation: tracker ? tracker.snapshot() : null,
         tracker,
@@ -271,7 +308,7 @@ export class PerformanceStore {
       if (command.status === 'ended' && session.tracker) {
         session.tracker.finalize();
       }
-    } else {
+    } else if (command.type === 'registerCue') {
       if (session.status !== 'running') {
         reject(
           'NOT_RUNNING',
@@ -282,6 +319,65 @@ export class PerformanceStore {
       // Exactly one frontier step per accepted cue — rejected commands
       // throw above and never advance the distance state.
       session.tracker?.append(command.cue);
+    } else {
+      if (session.status !== 'paused') {
+        reject(
+          'NOT_PAUSED',
+          `Registered cues can only be corrected while paused; session is "${session.status}".`,
+        );
+      }
+
+      const index = command.position - 1;
+      if (!Number.isInteger(index) || index < 0 || index >= session.cues.length) {
+        reject(
+          'INVALID_POSITION',
+          `Cue position ${command.position} does not exist in the current timeline (length ${session.cues.length}).`,
+        );
+      }
+      if (session.cues[index] !== command.oldCue) {
+        reject(
+          'OLD_CUE_MISMATCH',
+          `Cue at position ${command.position} is ${session.cues[index]}, not ${command.oldCue}.`,
+        );
+      }
+
+      // Build the complete candidate timeline first. A correction can make
+      // the previously monotone frontier recoverable again, so it is not safe
+      // to mutate or reuse the old tracker: replay the fixed plan against the
+      // candidate from row zero. No existing aggregate field is touched until
+      // this rebuild has completed.
+      const nextCues = [...session.cues];
+      nextCues[index] = command.newCue;
+      let nextTracker: PrefixDistanceTracker | null = null;
+      let nextDeviation: DeviationState | null = null;
+      if (session.plan) {
+        try {
+          nextTracker = new PrefixDistanceTracker(session.plan.cues, session.plan.k);
+          for (const cue of nextCues) nextTracker.append(cue);
+          nextDeviation = nextTracker.snapshot();
+        } catch (err) {
+          // The candidate and the stored aggregate are both still intact at
+          // this point. Surface the rebuild failure as an adjudication error
+          // rather than committing any half-built state.
+          throw new ApiError(
+            'COMMAND_REJECTED',
+            `Failed to rebuild deviation state from the corrected timeline: ${(err as Error).message}`,
+            409,
+            'REBUILD_FAILED',
+          );
+        }
+      }
+
+      const nextVersion = session.version + 1;
+      session.cues = nextCues;
+      session.tracker = nextTracker;
+      session.deviation = nextDeviation;
+      session.corrections.push({
+        position: command.position,
+        oldCue: command.oldCue,
+        newCue: command.newCue,
+        version: nextVersion,
+      });
     }
 
     // Single commit point: version bump and request-id recording happen
@@ -301,6 +397,7 @@ export class PerformanceStore {
       version: session.version,
       requestId: session.requestId,
       cues: [...session.cues],
+      corrections: session.corrections.map((correction) => ({ ...correction })),
       plan: session.plan ? { cues: [...session.plan.cues], k: session.plan.k } : null,
       deviation: session.deviation ? { ...session.deviation, final: session.deviation.final ? { ...session.deviation.final } : null } : null,
     };

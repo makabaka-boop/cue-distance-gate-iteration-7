@@ -49,6 +49,13 @@ export interface DeviationState {
   final: DeviationFinal | null;
 }
 
+export interface CueCorrectionRecord {
+  position: number;
+  oldCue: number;
+  newCue: number;
+  version: number;
+}
+
 export interface Performance {
   id: string;
   name: string;
@@ -56,6 +63,7 @@ export interface Performance {
   version: number;
   requestId: string | null;
   cues: number[];
+  corrections: CueCorrectionRecord[];
   plan: PlannedCueSequence | null;
   deviation: DeviationState | null;
 }
@@ -79,6 +87,15 @@ export type PerformanceCommand =
       command: 'registerCue';
       performanceId: string;
       cue: number;
+      expectedVersion: number;
+      requestId: string;
+    }
+  | {
+      command: 'correctCue';
+      performanceId: string;
+      position: number;
+      oldCue: number;
+      newCue: number;
       expectedVersion: number;
       requestId: string;
     };

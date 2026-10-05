@@ -156,6 +156,10 @@ export interface ConsoleState {
   loadIdDraft: string;
   /** Cue text the stage manager typed; it is only consumed on a commit. */
   cueDraft: string;
+  /** Correction form used only while a session is paused for review. */
+  correctionPositionDraft: string;
+  correctionOldDraft: string;
+  correctionNewDraft: string;
   /**
    * Optional fixed-plan drafts for the *next* create command. They remain
    * editable page drafts until a create commits and can never alter the plan
@@ -214,6 +218,9 @@ export class ConsoleStore extends Store<ConsoleState> {
       nameDraft: '',
       loadIdDraft: '',
       cueDraft: '',
+      correctionPositionDraft: '',
+      correctionOldDraft: '',
+      correctionNewDraft: '',
       planEnabledDraft: false,
       planCuesDraft: '',
       planKDraft: '',
@@ -231,6 +238,18 @@ export class ConsoleStore extends Store<ConsoleState> {
 
   setCueDraft(cueDraft: string): void {
     this.patch({ cueDraft });
+  }
+
+  setCorrectionPositionDraft(correctionPositionDraft: string): void {
+    this.patch({ correctionPositionDraft });
+  }
+
+  setCorrectionOldDraft(correctionOldDraft: string): void {
+    this.patch({ correctionOldDraft });
+  }
+
+  setCorrectionNewDraft(correctionNewDraft: string): void {
+    this.patch({ correctionNewDraft });
   }
 
   setPlanEnabled(planEnabledDraft: boolean): void {
@@ -253,23 +272,25 @@ export class ConsoleStore extends Store<ConsoleState> {
    * response may only catch the *same* session up in version — it can never
    * switch sessions or roll a version backwards.
    */
-  private adoptSnapshot(next: Performance, stale: boolean): void {
+  private adoptSnapshot(next: Performance, stale: boolean): boolean {
     const current = this.sessionRef;
     if (stale) {
       if (!current || current.id !== next.id || next.version <= current.version) {
-        return;
+        return false;
       }
     } else if (current && current.id === next.id && current.version > next.version) {
-      return;
+      return false;
     }
     this.sessionRef = next;
     this.patch({ session: next });
+    return true;
   }
 
   private runCommand(
     action: () => Promise<Performance>,
     targetSessionId: string | null,
     cueSessionId?: string,
+    correctionSessionId?: string,
   ): void {
     const cmdGen = ++this.commandGeneration;
     const viewGen = ++this.viewGeneration;
@@ -279,7 +300,7 @@ export class ConsoleStore extends Store<ConsoleState> {
     void action().then(
       (snapshot) => {
         const stale = this.viewGeneration !== viewGen;
-        this.adoptSnapshot(snapshot, stale);
+        const adopted = this.adoptSnapshot(snapshot, stale);
         if (cueSessionId) {
           this.pendingCueSessions.delete(cueSessionId);
           // A committed cue consumes its draft only when the box is still
@@ -289,6 +310,13 @@ export class ConsoleStore extends Store<ConsoleState> {
           if (currentId === cueSessionId) {
             this.patch({ cueDraft: '' });
           }
+        }
+        if (correctionSessionId && adopted && (this.sessionRef?.id ?? null) === correctionSessionId) {
+          this.patch({
+            correctionPositionDraft: '',
+            correctionOldDraft: '',
+            correctionNewDraft: '',
+          });
         }
       },
       (err) => {
@@ -411,6 +439,38 @@ export class ConsoleStore extends Store<ConsoleState> {
           requestId: this.deps.newRequestId(),
         }),
       session.id,
+      session.id,
+    );
+  }
+
+  correctCue(): void {
+    const session = this.state.session;
+    if (!session) return;
+    let position: number;
+    let oldCue: number;
+    let newCue: number;
+    try {
+      position = parseInt32(this.state.correctionPositionDraft);
+      oldCue = parseInt32(this.state.correctionOldDraft);
+      newCue = parseInt32(this.state.correctionNewDraft);
+      if (position < 1) throw new ClientError('INVALID_POSITION', '位置必须是从 1 开始的正整数。');
+    } catch (err) {
+      this.patch({ error: toConsoleError(err) });
+      return;
+    }
+    this.runCommand(
+      () =>
+        this.deps.submit({
+          command: 'correctCue',
+          performanceId: session.id,
+          position,
+          oldCue,
+          newCue,
+          expectedVersion: session.version,
+          requestId: this.deps.newRequestId(),
+        }),
+      session.id,
+      undefined,
       session.id,
     );
   }

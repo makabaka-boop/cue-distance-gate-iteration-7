@@ -185,21 +185,25 @@ export default function PerformanceConsole({ store }: { store: ConsoleStore }) {
           )}
 
           {session.status === 'paused' && (
-            <div className="actions">
-              <button onClick={() => store.transition('running')} disabled={s.commandBusy}>
-                继续（→ 运行）
-              </button>
-              <button
-                className="danger"
-                onClick={() => store.transition('ended')}
-                disabled={s.commandBusy}
-              >
-                结束
-              </button>
-            </div>
+            <>
+              <div className="actions">
+                <button onClick={() => store.transition('running')} disabled={s.commandBusy}>
+                  继续（→ 运行）
+                </button>
+                <button
+                  className="danger"
+                  onClick={() => store.transition('ended')}
+                  disabled={s.commandBusy}
+                >
+                  结束
+                </button>
+              </div>
+              <CorrectionForm store={store} busy={s.commandBusy} />
+            </>
           )}
 
           <Timeline session={session} />
+          <CorrectionLog session={session} />
         </article>
       )}
     </section>
@@ -307,6 +311,86 @@ function DeviationPanel({ session }: { session: Performance }) {
         <pre>{JSON.stringify(plan.cues)}</pre>
       </details>
     </section>
+  );
+}
+
+function CorrectionForm({ store, busy }: { store: ConsoleStore; busy: boolean }) {
+  const s = useStore(store);
+  return (
+    <form
+      className="correction-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        store.correctCue();
+      }}
+    >
+      <h3>暂停核查：更正已登记 cue</h3>
+      <p className="correction-help">
+        仅暂停态可提交；时间线只保留替换后的生效值，旧值、新值与提交版本会另存为更正记录。
+      </p>
+      <div className="correction-fields">
+        <label className="field">
+          <span>原位置（从 1 开始）</span>
+          <input
+            type="number"
+            min={1}
+            step={1}
+            value={s.correctionPositionDraft}
+            onChange={(e) => store.setCorrectionPositionDraft(e.target.value)}
+            placeholder="如 2"
+            disabled={busy}
+          />
+        </label>
+        <label className="field">
+          <span>预期旧值</span>
+          <input
+            type="number"
+            step={1}
+            value={s.correctionOldDraft}
+            onChange={(e) => store.setCorrectionOldDraft(e.target.value)}
+            placeholder="当前记录值"
+            disabled={busy}
+          />
+        </label>
+        <label className="field">
+          <span>替换值</span>
+          <input
+            type="number"
+            step={1}
+            value={s.correctionNewDraft}
+            onChange={(e) => store.setCorrectionNewDraft(e.target.value)}
+            placeholder="正确 cue"
+            disabled={busy}
+          />
+        </label>
+        <button type="submit" disabled={busy}>
+          {busy ? '提交中…' : '提交更正'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function CorrectionLog({ session }: { session: Performance }) {
+  if (session.corrections.length === 0) return null;
+  return (
+    <details className="correction-log">
+      <summary>更正记录（{session.corrections.length} 条；时间线仅显示生效值）</summary>
+      <ol>
+        {session.corrections.map((correction, i) => (
+          <li key={`${correction.version}-${correction.position}-${i}`}>
+            <span>位置 #{correction.position}</span>
+            <span>
+              旧值 <code>{correction.oldCue}</code>
+            </span>
+            <span>
+              新值 <code>{correction.newCue}</code>
+            </span>
+            <span>提交版本 #{correction.version}</span>
+          </li>
+        ))}
+      </ol>
+    </details>
   );
 }
 

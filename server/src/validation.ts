@@ -171,7 +171,7 @@ function asStatus(value: unknown): PerformanceStatus {
   return value as PerformanceStatus;
 }
 
-function asCue(value: unknown): number {
+function asCue(value: unknown, field = 'cue'): number {
   if (
     typeof value !== 'number' ||
     !Number.isInteger(value) ||
@@ -180,8 +180,15 @@ function asCue(value: unknown): number {
   ) {
     throw new ApiError(
       'INVALID_CUE',
-      'Field "cue" must be a 32-bit signed integer.',
+      `Field "${field}" must be a 32-bit signed integer.`,
     );
+  }
+  return value;
+}
+
+function asPosition(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    invalidBody('Field "position" must be a positive integer.');
   }
   return value;
 }
@@ -242,9 +249,21 @@ export function parsePerformanceCommand(body: unknown): PerformanceCommand {
         requestId,
       };
     }
+    case 'correctCue': {
+      const performanceId = asNonEmptyString(obj.performanceId, 'performanceId');
+      return {
+        type: 'correctCue',
+        performanceId,
+        position: asPosition(obj.position),
+        oldCue: asCue(obj.oldCue, 'oldCue'),
+        newCue: asCue(obj.newCue, 'newCue'),
+        expectedVersion: asExpectedVersion(obj.expectedVersion),
+        requestId,
+      };
+    }
     default:
       invalidBody(
-        'Field "command" must be one of: create, transition, registerCue.',
+        'Field "command" must be one of: create, transition, registerCue, correctCue.',
       );
   }
 }

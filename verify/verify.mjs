@@ -7,7 +7,8 @@
  *   3. stable error codes for invalid JSON, non-integers and out-of-range input,
  *   4. the web page and its /api proxy integration,
  *   5. the performance session console lifecycle through the web proxy,
- *      including refresh reload and the sealed read-only timeline,
+ *      including refresh reload, paused cue-correction rebuilds and the
+ *      sealed read-only timeline,
  *   6. global cross-session requestId deduplication: barrier-interleaved
  *      "two sessions", "create vs modify" and "retarget after commit"
  *      groups, checking success counts, the first-owner attribution,
@@ -766,6 +767,207 @@ console.log('\n[5b] planned session: per-cue frontier, final verdict and no-adva
     cue.body?.performance?.plan === null && cue.body?.performance?.deviation === null &&
       end.body?.performance?.plan === null && end.body?.performance?.deviation === null,
     JSON.stringify({ cue: cue.body?.performance?.deviation, end: end.body?.performance?.deviation }));
+}
+
+// ------------------------------------------------- paused cue corrections
+console.log('\n[5c] paused cue corrections: rebuild, idempotency and boundaries');
+{
+  const plan = [1, 2, 3, 4];
+  const create = await sendCommand(WEB_URL, {
+    command: 'create',
+    name: '暂停更正-重建',
+    requestId: commandRequestId('correction-create'),
+    planCues: plan,
+    k: 1,
+  });
+  const id = create.body.performance.id;
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('correction-start'),
+  });
+  let v = 2;
+  for (const cue of [1, 2, 9, 8]) {
+    const res = await sendCommand(WEB_URL, {
+      command: 'registerCue', performanceId: id, cue,
+      expectedVersion: v, requestId: commandRequestId(`correction-cue-${cue}`),
+    });
+    check(`correction setup cue ${cue} commits`, res.status === 200, JSON.stringify(res.body));
+    v += 1;
+  }
+  const beforePause = await getPerformance(WEB_URL, id);
+  check('prefix is unrecoverable before correction',
+    beforePause.body.performance.deviation.recoverable === false,
+    JSON.stringify(beforePause.body.performance.deviation));
+
+  const pause = await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'paused',
+    expectedVersion: v, requestId: commandRequestId('correction-pause'),
+  });
+  check('correction setup paused', pause.status === 200, JSON.stringify(pause.body));
+  v += 1;
+
+  // Paused boundary: register remains rejected.
+  const registerWhilePaused = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: id, cue: 3,
+    expectedVersion: v, requestId: commandRequestId('correction-register-paused'),
+  });
+  check(
+    'register while paused for correction session -> NOT_RUNNING',
+    registerWhilePaused.statusCode === 409 &&
+      registerWhilePaused.body.error.reason === 'NOT_RUNNING',
+    JSON.stringify(registerWhilePaused.body),
+  );
+
+  const staleVersion = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 4,
+    oldCue: 8, newCue: 3,
+    expectedVersion: v - 1, requestId: commandRequestId('correction-stale'),
+  });
+  check(
+    'stale correction expectedVersion -> VERSION_CONFLICT before rebuilding',
+    staleVersion.statusCode === 409 && staleVersion.body.error.reason === 'VERSION_CONFLICT',
+    JSON.stringify(staleVersion.body),
+  );
+
+  const invalidPosition = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 99,
+    oldCue: 8, newCue: 3,
+    expectedVersion: v, requestId: commandRequestId('correction-bad-position'),
+  });
+  check(
+    'correction at missing position -> INVALID_POSITION and no commit',
+    invalidPosition.statusCode === 409 &&
+      invalidPosition.body.error.reason === 'INVALID_POSITION',
+    JSON.stringify(invalidPosition.body),
+  );
+
+  const mismatch = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 4,
+    oldCue: 7, newCue: 3,
+    expectedVersion: v, requestId: commandRequestId('correction-old-mismatch'),
+  });
+  check(
+    'correction with wrong oldCue -> OLD_CUE_MISMATCH and no commit',
+    mismatch.statusCode === 409 && mismatch.body.error.reason === 'OLD_CUE_MISMATCH',
+    JSON.stringify(mismatch.body),
+  );
+
+  const correctionId = commandRequestId('correction-commit');
+  const correctionPayload = {
+    command: 'correctCue', performanceId: id, position: 4,
+    oldCue: 8, newCue: 3,
+    expectedVersion: v, requestId: correctionId,
+  };
+  const corrected = await sendCommand(WEB_URL, correctionPayload);
+  check(
+    'correction rebuilds from fixed plan and can return to recoverable',
+    corrected.statusCode === 200 &&
+      corrected.body.performance.version === v + 1 &&
+      JSON.stringify(corrected.body.performance.cues) === JSON.stringify([1, 2, 9, 3]) &&
+      corrected.body.performance.deviation.boundary === 1 &&
+      corrected.body.performance.deviation.recoverable === true,
+    JSON.stringify(corrected.body),
+  );
+  check(
+    'correction audit record stores old, new and submitted version; timeline is effective only',
+    JSON.stringify(corrected.body.performance.corrections) ===
+      JSON.stringify([{ position: 4, oldCue: 8, newCue: 3, version: v + 1 }]),
+    JSON.stringify(corrected.body.performance.corrections),
+  );
+  v += 1;
+
+  const duplicate = await sendCommand(WEB_URL, correctionPayload);
+  check(
+    'replaying committed correction -> DUPLICATE_REQUEST and no second commit',
+    duplicate.statusCode === 409 && duplicate.body.error.reason === 'DUPLICATE_REQUEST',
+    JSON.stringify(duplicate.body),
+  );
+
+  // A second, converging correction must use the effective value produced by
+  // the first one and rebuild again from the complete candidate sequence.
+  const second = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 3,
+    oldCue: 9, newCue: 2,
+    expectedVersion: v, requestId: commandRequestId('correction-converge'),
+  });
+  check(
+    'consecutive correction uses current effective value and preserves both records',
+    second.statusCode === 200 &&
+      second.body.performance.version === v + 1 &&
+      JSON.stringify(second.body.performance.cues) === JSON.stringify([1, 2, 2, 3]) &&
+      second.body.performance.deviation.boundary === 1 &&
+      second.body.performance.corrections.length === 2,
+    JSON.stringify(second.body),
+  );
+  v += 1;
+
+  // Ended is terminal: corrections cannot modify the sealed effective timeline.
+  const end = await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'ended',
+    expectedVersion: v, requestId: commandRequestId('correction-end'),
+  });
+  check(
+    'corrected session end computes final verdict from effective timeline',
+    end.statusCode === 200 &&
+      JSON.stringify(end.body.performance.deviation.final) ===
+        JSON.stringify({ status: 'ok', distance: 1 }),
+    JSON.stringify(end.body),
+  );
+  v += 1;
+  const afterEnd = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 3,
+    oldCue: 2, newCue: 9,
+    expectedVersion: v, requestId: commandRequestId('correction-after-end'),
+  });
+  check(
+    'correction after end -> NOT_PAUSED; sealed timeline and records remain',
+    afterEnd.statusCode === 409 && afterEnd.body.error.reason === 'NOT_PAUSED',
+    JSON.stringify(afterEnd.body),
+  );
+  const sealed = await getPerformance(WEB_URL, id);
+  check(
+    'sealed snapshot keeps effective cues and full correction history',
+    JSON.stringify(sealed.body.performance.cues) === JSON.stringify([1, 2, 2, 3]) &&
+      sealed.body.performance.corrections.length === 2 &&
+      sealed.body.performance.version === v,
+    JSON.stringify(sealed.body.performance),
+  );
+}
+
+// Legacy sessions may be corrected, but still never expose plan/deviation.
+{
+  const create = await sendCommand(WEB_URL, {
+    command: 'create',
+    name: '暂停更正-旧场次',
+    requestId: commandRequestId('legacy-correction-create'),
+  });
+  const id = create.body.performance.id;
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('legacy-correction-start'),
+  });
+  await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: id, cue: 9,
+    expectedVersion: 2, requestId: commandRequestId('legacy-correction-cue'),
+  });
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'paused',
+    expectedVersion: 3, requestId: commandRequestId('legacy-correction-pause'),
+  });
+  const corrected = await sendCommand(WEB_URL, {
+    command: 'correctCue', performanceId: id, position: 1,
+    oldCue: 9, newCue: 10,
+    expectedVersion: 4, requestId: commandRequestId('legacy-correction-commit'),
+  });
+  check(
+    'legacy correction updates cues/records but still has null plan/deviation',
+    corrected.statusCode === 200 &&
+      JSON.stringify(corrected.body.performance.cues) === '[10]' &&
+      corrected.body.performance.corrections.length === 1 &&
+      corrected.body.performance.plan === null &&
+      corrected.body.performance.deviation === null,
+    JSON.stringify(corrected.body),
+  );
 }
 
 // Cross-session: two planned sessions keep independent plans/frontiers.
