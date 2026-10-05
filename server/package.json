@@ -1,0 +1,21 @@
+{
+  "name": "cue-diff-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bounded insertion/deletion distance API for stage cue sequences",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run typecheck && vitest run"
+  },
+  "dependencies": {
+    "fastify": "^5.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  }
+}

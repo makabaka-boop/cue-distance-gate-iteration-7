@@ -1,0 +1,51 @@
+name: cue-diff
+
+services:
+  server:
+    build: ./server
+    environment:
+      PORT: 3000
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      - app
+
+  web:
+    build: ./web
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - app
+
+  # One-shot acceptance suite: runs the reference checks and exits.
+  verify:
+    build: ./verify
+    depends_on:
+      server:
+        condition: service_healthy
+      web:
+        condition: service_started
+    environment:
+      API_URL: http://server:3000
+      WEB_URL: http://web
+      # Must match the host-published web port below so the override can be
+      # exercised from inside the verify container via host.docker.internal.
+      WEB_PORT: "${WEB_PORT:-8080}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: "no"
+    networks:
+      - app
+
+networks:
+  app:
